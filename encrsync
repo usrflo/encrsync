@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+# Copyright (c) 2014 Florian Sager <sager at agitos.de>
+# License: GPLv3, http://www.gnu.org/licenses/gpl-3.0.en.html
+# 
+# encrsync is derived from encrb, written by
+# Copyright (c) 2012-2014 Heikki Hokkanen <hoxu at users.sf.net>
+# License: GPLv3, http://www.gnu.org/licenses/gpl-3.0.en.html
+# 
+# encrsync - encrypted remote backup
+#
+# Backs up plaintext local directories to remote machine as encrypted, using
+# encfs --reverse and rsync
+#
+import os
+import random
+import string
+import subprocess
+from subprocess import Popen, PIPE
+import sys
+import tempfile
+import time
+from distutils import spawn
+from lxml import etree
+
+class Encrsync:
+
+	def __init__(self, arguments):
+		self.arguments = arguments
+		self.default_keyfile = '~/.encfs6-encrsync.xml'
+		self.default_passfile = '~/.encfs-password'
+		self.message_run_as_root = 'this script must be run as root to mount encfs encryption' 
+
+	def backup_path(self, path, setup = False):
+		if setup:
+			print 'Setup encryption of path ', path
+		else:
+			print 'Backup path ', path
+		friendlyname = self.path_to_string(path)
+		tmpdir = tempfile.mkdtemp('-' + friendlyname)
+		
+		if tempfile.gettempdir() == path:
+			print 'Because of limitations in the implementation of encfs, the temp directory', path, 'cannot be sync\'ed directly. Please use a parent or sub-directory instead.'
+			return
+
+		# create encfs mount
+		print 'Make encfs reverse mount to "%s"' % tmpdir
+		env = self.get_modified_env()
+		if setup:
+			FNULL = open(os.devnull, 'w')
+			err = subprocess.call(['encfs', '--standard', '--extpass', 'cat %s' % os.path.expanduser(self.passfile), '--reverse', path, tmpdir], env=env, stdout=FNULL, stderr=subprocess.STDOUT)
+		else:
+			err = subprocess.call(['encfs', '--extpass', 'cat %s' % os.path.expanduser(self.passfile), '--reverse', path, tmpdir], env=env)
+
+		# rsync
+		if setup == False and err == 0:
+			try:
+				# destination = os.path.join(self.destination, friendlyname)
+				print 'Rsyncing encrypted "%s" to "%s"' % (path, self.destination)
+				sys.stdout.flush()
+				# adapt rsync command, exclude tmpdir if inside backup directory
+				if (tmpdir.startswith(path)):
+					self.rsyncargs.insert(-2, "--exclude='" + os.path.relpath(tmpdir, '/') + "'")
+				self.rsyncargs[-2] = tmpdir + '/'
+				# print self.rsyncargs
+				# subprocess.call(self.rsyncargs)
+				print " ".join(self.rsyncargs)
+				p = Popen(self.rsyncargs, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+				output, err = p.communicate()
+				if output!='':
+					print output
+				if p.returncode != 0:
+					print err
+				# backup the keyfile in cleartext
+				subprocess.call(['rsync', '-az', '-e', 'ssh -oStrictHostKeyChecking=no', '--numeric-ids', self.keyfile, self.destination])
+			except KeyboardInterrupt, e:
+				print 'KeyboardInterrupt, sleeping 1 sec, then unmounting'
+				time.sleep(1)
+				subprocess.call(['fusermount', '-u', tmpdir])
+				os.rmdir(tmpdir)
+				raise e
+		elif setup == True and err == 0:
+			print 'encfs setup successful for path ' + path
+		else:
+			print 'encfs returned error for path ' + path, err
+
+		# Unmount
+		print 'Unmounting encfs reverse mount'
+		subprocess.call(['fusermount', '-u', tmpdir])
+
+		os.rmdir(tmpdir)
+
+	def restore_path(self, remote_path):
+
+		if os.path.exists(self.destination) == False:
+			sys.exit('Restore destination root path '+self.destination+' does not exist. Please create this directory first.')
+
+		friendlyname = self.path_to_string(remote_path)
+		tmpdir = tempfile.mkdtemp('-' + friendlyname)
+		print 'Restore remote', remote_path, 'to local', self.destination
+
+		# create encfs mount
+		print 'Making encfs reverse mount to "%s"' % tmpdir
+		env = self.get_modified_env()
+		err = subprocess.call(['encfs', '--extpass', 'cat %s' % os.path.expanduser(self.passfile), '--reverse', self.destination, tmpdir], env=env)
+
+		# rsync
+		if err == 0:
+			try:
+				# destination = os.path.join(self.destination, friendlyname)
+				# print 'Rsyncing encrypted "%s" to unencrypted "%s"...' % (remote_path, destination)
+				sys.stdout.flush()
+				# subprocess.call(['rsync', '-az', '-e', 'ssh -oStrictHostKeyChecking=no', '--numeric-ids', '--delete-delay', '--delete-excluded', '--bwlimit', str(self.options.bwlimit), remote_path, tmpdir + '/'])
+				self.rsyncargs[-1] = tmpdir + '/'
+				print " ".join(self.rsyncargs)
+				p = Popen(self.rsyncargs, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+				output, err = p.communicate()
+				if output!='':
+					print output
+				if p.returncode != 0:
+					print err
+
+			except KeyboardInterrupt, e:
+				print 'KeyboardInterrupt, sleeping 1 sec, then unmounting'
+				time.sleep(1)
+				subprocess.call(['fusermount', '-u', tmpdir])
+				os.rmdir(tmpdir)
+				raise e
+		else:
+			print 'encfs returned error for remote_path ' + remote_path, err
+
+		# Unmount
+		print 'Unmounting encfs reverse mount'
+		subprocess.call(['fusermount', '-u', tmpdir])
+
+		os.rmdir(tmpdir)
+
+	def usage(self):
+		print "USAGE"
+		print "\tBackup : encrsync [OPTION...] SRC [USER@]HOST:DEST";
+		print "\tRestore: encrsync [OPTION...] [USER@]HOST:SRC [DEST]";
+		
+		print "\nHINT 1\t",self.message_run_as_root
+		print "\nHINT 2\t","Please mind that only one source directory can be sync'ed"
+		print "\nHINT 3\t","After changing your keyfile/passfile please assure to sync by rsync option --checksum at least once!"
+
+		print "\nOPTIONS SUMMARY"
+		print "\t--keyfile\tencfs keyfile to use, default",self.default_keyfile
+		print "\t\t\tFile is created if not existing"
+		print "\t--passfile\tfile containing encfs keyfile password, default",self.default_passfile
+		print "\t\t\tFile is created if not existing"
+		print "\t--no-snapshot\tCreate no snapshot after running a backup, default: create snapshot"
+		print "\t-<rsync-opt...>\tEvery option of your rsync binary. Run rsync --help for a complete listing."
+		
+		sys.exit("")
+
+	def run(self):
+
+		if len(self.arguments) < 3:
+			self.usage()
+
+		if not os.geteuid() == 0:
+			sys.exit("ERROR: "+self.message_run_as_root)
+
+		rsync_path = self.get_executable_path('rsync', 'rsync')
+		ssh_path = self.get_executable_path('ssh', 'openssh-client')
+		encfs_path = self.get_executable_path('encfs', 'encfs')
+
+		if rsync_path == None or ssh_path == None or encfs_path == None:
+			sys.exit('Quit')
+		
+		# TODO check that running new enough encfs (old has bugs in --reverse mode)
+		
+		self.check_ssh_keys()
+
+		# print self.arguments
+		
+		self.keyfile = self.default_keyfile
+		self.passfile = self.default_passfile
+		self.create_snapshot = True
+
+		self.rsyncargs = ['rsync']
+		for i in range(1, len(self.arguments)):
+			arg = self.arguments[i]
+			if arg == '--keyfile':
+				self.keyfile = self.get_next_argument(i)
+			elif arg == '--passfile':
+				self.passfile = self.get_next_argument(i)
+			elif arg == '--no-snapshot':
+				self.create_snapshot = False
+			else:
+				self.rsyncargs.append(arg)
+
+		self.keyfile = os.path.expanduser(self.keyfile)
+		self.passfile = os.path.expanduser(self.passfile)
+
+		self.origin = self.rsyncargs[-2]
+		self.destination = self.rsyncargs[-1]
+
+		if ':' in self.destination and ':' not in self.origin:
+			self.backup = True
+			self.origin = os.path.abspath(self.origin)
+			self.rsyncargs[-2] = self.origin
+		elif ':' in self.origin and ':' not in self.destination:
+			self.backup = False
+			self.destination = os.path.abspath(self.destination)
+			self.rsyncargs[-1] = self.destination
+		else:
+			print 'Origin:\t\t', self.origin
+			print 'Destination:\t', self.destination
+			sys.exit("ERROR: either destination or origin has to be a remote path for remote backup or restore")
+
+		'''
+		for p in self.args[:-1]:
+			if options.restore:
+				self.restore_path(p)
+			else:
+				self.backup_path(os.path.abspath(p))
+		'''
+		
+		if self.backup:
+			self.setup_once()
+			self.assure_unencrypted_filenames()			
+			self.backup_path(self.origin)
+		else:
+			self.restore_path(self.origin)
+
+		if self.backup and self.create_snapshot:
+			# create snapshot if backup was finished successfully
+			snapshotFile = tempfile.gettempdir() + '/.rsync-snapshot'
+			self.touch(snapshotFile, None)
+			subprocess.call(['rsync', '-e', 'ssh -oStrictHostKeyChecking=no', '--numeric-ids', snapshotFile, self.destination])
+			os.remove(snapshotFile)
+			print 'Create snapshot'
+
+	def setup_once(self):
+		if os.path.exists(self.keyfile) and os.path.exists(self.passfile):
+			return
+
+		print 'Hint: keyfile or passfile missing, running in setup mode.'
+
+		if os.path.exists(self.passfile) == False:
+			# generate and save password
+			password = ''.join(random.choice(string.letters + string.digits) for _ in range(12))
+
+			print 'IMPORTANT: Generated random password "'+password+'".\nNOTE THIS PASSWORD TO BE ABLE TO CREATE A FULL RESTORE!'
+			uinput = False
+			while uinput != 'yes':
+				uinput = raw_input('Did you note the password above? Enter "yes" to continue: ')
+				
+			f = open(self.passfile, 'w')
+			f.write(password)
+			f.close()
+
+		# for p in self.args[:-1]:
+		#	self.backup_path(p, True)
+		self.backup_path(self.origin, True)
+		
+	def get_executable_path(self, executable, packagename):
+		
+		executable_path = spawn.find_executable(executable)
+		if executable_path:
+			return executable_path
+		
+		installer_path = spawn.find_executable('apt-get')
+		if installer_path:
+			subprocess.call([installer_path, 'install', packagename])
+			executable_path = spawn.find_executable(executable)
+			return executable_path
+		
+		installer_path = spawn.find_executable('rpm')
+		if installer_path:
+			subprocess.call([installer_path, '-i', packagename])
+			executable_path = spawn.find_executable(executable)
+			return executable_path
+		
+		# raise EnvironmentError("'" + executable + "' not available, please install the according package")
+		print "'" + executable + "' not available, please install the package '" + packagename + "' and try again\n"
+		return None
+	
+	# <nameAlg>
+	#	<name>nameio/block</name>
+	#	<major>3</major>
+	#	<minor>0</minor>
+	# </nameAlg>
+	# --> rewrite to:
+	# <nameAlg>
+	#	<name>nameio/null</name>
+	#	<major>1</major>
+	#	<minor>0</minor>
+	# </nameAlg>
+	def assure_unencrypted_filenames(self):
+		keyfile_doc = etree.parse(self.keyfile)
+		
+		cfg_element = keyfile_doc.find('cfg')
+		nameAlg_element = cfg_element.find('nameAlg')
+		name_element = nameAlg_element.find('name')
+		if name_element.text == 'nameio/null':
+			return
+		
+		name_element.text = 'nameio/null'
+		nameAlg_element.find('major').text = '1'
+		nameAlg_element.find('minor').text = '0'
+
+		outFile = open(self.keyfile, 'w')
+		# keyfile_doc.write(outFile, encoding='utf-8', xml_declaration=True, standalone="yes")
+		keyfile_doc.write(outFile);
+		outFile.close()
+		# write xml header compatible to encfs
+		with open(self.keyfile, "r+") as f:
+			s = f.read();
+			f.seek(0);
+			f.write('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n' + s)
+
+		return
+	
+	def check_ssh_keys(self):
+		sshkey_path = os.path.expanduser("~/.ssh/")
+		if not os.path.isdir(sshkey_path):
+			os.mkdir(sshkey_path, 0700)
+		if not os.path.isfile(sshkey_path+'id_rsa') or not os.path.isfile(sshkey_path+'id_rsa.pub'):
+			sshkeygen_path = self.get_executable_path('ssh-keygen', 'openssh-client')
+			subprocess.call([sshkeygen_path, '-t', 'rsa', '-f', sshkey_path + 'id_rsa', '-q', '-N', ''])
+			print "Your public SSH key to add to your TrustedSpace backup account:"
+			with open(sshkey_path+'id_rsa.pub', 'r') as fin:
+				print fin.read()
+	
+	def get_modified_env(self):
+		env = dict(os.environ)
+		env['ENCFS6_CONFIG'] = os.path.expanduser(self.keyfile)
+		return env
+
+	def get_next_argument(self, position):
+		if (len(self.arguments)<=position+1):
+			self.usage()
+		return self.arguments[position+1]
+
+	def path_to_string(self, path):
+		return path.strip('/').replace('/', '-')
+
+	def touch(self, fname, times=None):
+		fhandle = open(fname, 'a')
+		try:
+			os.utime(fname, times)
+		finally:
+			fhandle.close()
+
+e = Encrsync(sys.argv)
+e.run()
